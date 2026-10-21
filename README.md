@@ -14,6 +14,7 @@ A tiny, free macOS menu bar app that <b>soft-disconnects</b> any display — no 
 
 - **Disconnect / reconnect any display** from the menu bar. macOS treats a disconnected display as if its cable were unplugged: windows move to the remaining screens and the GPU stops driving it. Works for external monitors and the MacBook built-in display.
 - **Resolution & refresh rate** — lists every mode, including HiDPI and the system default.
+- **Brightness & volume sliders** right in the menu. External monitors are controlled over DDC/CI (Apple silicon; the monitor must support DDC), the built-in display natively. Volume follows the current output device, using the monitor's own volume over DDC when audio goes through HDMI/DisplayPort.
 - **Reset Connections** (⌘R) — reconnect everything that was disconnected and forget displays that were physically unplugged. Resolutions are left alone.
 - **Safety net** — you can't disconnect the last display, and if all screens ever go dark (e.g. built-in disconnected, then the external cable is pulled) everything is reconnected automatically.
 - **Session-only** — disconnections reset on logout/restart, so you can never lock yourself out with a black screen.
@@ -54,6 +55,8 @@ $CLI toggle "LG"                   # toggle
 $CLI reset                         # reconnect all, forget unplugged displays
 $CLI modes Sceptre                 # list all resolutions / refresh rates
 $CLI res Sceptre 2560x1440 hidpi 60
+$CLI brightness LG 60               # brightness 0–100 (omit the value to read it)
+$CLI volume 30                     # volume of the current output device
 $CLI login on|off                  # launch at login
 ```
 

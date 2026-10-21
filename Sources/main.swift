@@ -1,7 +1,9 @@
 // DisplayToggle — menu bar / CLI tool to soft-disconnect external displays and change resolution.
 // Uses the private CoreGraphics API CGSConfigureDisplayEnabled (same approach as BetterDisplay).
 import AppKit
+import CoreAudio
 import CoreGraphics
+import IOKit
 import ServiceManagement
 import UserNotifications
 
@@ -22,7 +24,8 @@ func L(_ key: String) -> String {
     let zh: [String: String] = [
         "connected": "已连接", "disconnected": "已断开", "main": "主",
         "connect": "连接", "disconnect": "断开",
-        "resolution": "分辨率", "refresh": "刷新率", "default": "默认",
+        "resolution": "分辨率", "refresh": "刷新率", "default": "默认", "modes": "分辨率与刷新率",
+        "brightness": "亮度", "volume": "音量", "unsupported": "不支持",
         "resetConnections": "重置连接",
         "resetTip": "重新连接所有被断开的显示器，并移除已经拔掉线、无法再连接的显示器记录。不会改动分辨率等其他设置。",
         "quit": "退出", "launchAtLogin": "登录时启动", "needsApproval": "需要在系统设置中允许", "approvalTitle": "DisplayToggle 需要你的授权", "approvalBody": "请在「系统设置 → 通用 → 登录项」中允许 DisplayToggle，才能登录时自动启动。", "openSettings": "打开系统设置", "later": "稍后", "language": "语言", "system": "跟随系统",
@@ -32,7 +35,8 @@ func L(_ key: String) -> String {
     let en: [String: String] = [
         "connected": "Connected", "disconnected": "Disconnected", "main": "Main",
         "connect": "Connect", "disconnect": "Disconnect",
-        "resolution": "Resolution", "refresh": "Refresh Rate", "default": "Default",
+        "resolution": "Resolution", "refresh": "Refresh Rate", "default": "Default", "modes": "Resolution & Refresh Rate",
+        "brightness": "Brightness", "volume": "Volume", "unsupported": "Not supported",
         "resetConnections": "Reset Connections",
         "resetTip": "Reconnect every disconnected display and drop displays that are physically unplugged. Resolution and other settings are left unchanged.",
         "quit": "Quit", "launchAtLogin": "Launch at Login", "needsApproval": "Needs approval in System Settings", "approvalTitle": "DisplayToggle needs your approval", "approvalBody": "Allow DisplayToggle in System Settings → General → Login Items to launch it at login.", "openSettings": "Open System Settings", "later": "Later", "language": "Language", "system": "System Default",
@@ -166,39 +170,284 @@ enum Modes {
     }
 }
 
-/// Reconnect every disabled display, then forget displays that are physically gone.
-func resetAllConnections() {
+// MARK: - Brightness & volume
+
+/// Look up a C function at runtime, so missing private symbols (e.g. on Intel) don't break linking.
+func sym<T>(_ lib: String, _ name: String, _ type: T.Type) -> T? {
+    guard let h = dlopen(lib, RTLD_LAZY), let p = dlsym(h, name) else { return nil }
+    return unsafeBitCast(p, to: type)
+}
+
+/// DDC/CI to external displays over the private IOAVService API (Apple silicon only).
+enum DDC {
+    static let brightness: UInt8 = 0x10, volume: UInt8 = 0x62
+    static let queue = DispatchQueue(label: "DisplayToggle.ddc")
+
+    private static let iokit = "/System/Library/Frameworks/IOKit.framework/IOKit"
+    private static let create = sym(iokit, "IOAVServiceCreateWithService",
+        (@convention(c) (CFAllocator?, io_service_t) -> UnsafeMutableRawPointer?).self)
+    private static let copyEDID = sym(iokit, "IOAVServiceCopyEDID",
+        (@convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UnsafeMutableRawPointer?>) -> IOReturn).self)
+    private static let readI2C = sym(iokit, "IOAVServiceReadI2C",
+        (@convention(c) (UnsafeMutableRawPointer, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> IOReturn).self)
+    private static let writeI2C = sym(iokit, "IOAVServiceWriteI2C",
+        (@convention(c) (UnsafeMutableRawPointer, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> IOReturn).self)
+
+    /// Services of the active external displays, matched by EDID vendor/product/serial. Main thread only.
+    static var services: [CGDirectDisplayID: AnyObject] = [:]
+    /// Last known (value, max) per display and VCP code, so sliders open at the right spot. Main thread only.
+    static var cache: [String: (cur: Int, max: Int)] = [:]
+    static func key(_ id: CGDirectDisplayID, _ vcp: UInt8) -> String { "\(id)-\(vcp)" }
+
+    static func refresh() {
+        services = [:]
+        guard let create, let copyEDID else { return }
+        var it = io_iterator_t()
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"), &it) == KERN_SUCCESS
+        else { return }
+        defer { IOObjectRelease(it) }
+        var found: [(vendor: UInt32, model: UInt32, serial: UInt32, svc: AnyObject)] = []
+        while case let s = IOIteratorNext(it), s != 0 {
+            defer { IOObjectRelease(s) }
+            let loc = IORegistryEntryCreateCFProperty(s, "Location" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+            guard loc as? String == "External", let p = create(kCFAllocatorDefault, s) else { continue }
+            let svc = Unmanaged<AnyObject>.fromOpaque(p).takeRetainedValue()
+            var out: UnsafeMutableRawPointer?
+            guard copyEDID(p, &out) == kIOReturnSuccess, let out else { continue }
+            let e = [UInt8](Unmanaged<CFData>.fromOpaque(out).takeRetainedValue() as Data)
+            guard e.count >= 16 else { continue }
+            found.append((UInt32(e[8]) << 8 | UInt32(e[9]), UInt32(e[10]) | UInt32(e[11]) << 8,
+                          UInt32(e[12]) | UInt32(e[13]) << 8 | UInt32(e[14]) << 16 | UInt32(e[15]) << 24, svc))
+        }
+        for id in Displays.active() where CGDisplayIsBuiltin(id) == 0 {
+            if let i = found.firstIndex(where: {
+                $0.vendor == CGDisplayVendorNumber(id) && $0.model == CGDisplayModelNumber(id) && $0.serial == CGDisplaySerialNumber(id)
+            }) { services[id] = found.remove(at: i).svc }
+        }
+    }
+
+    private static func checksum(_ b: [UInt8]) -> UInt8 { b.reduce(0x6E ^ 0x51, ^) }
+
+    /// Blocking (~50 ms per attempt) — call off the main thread in the app.
+    static func read(_ svc: AnyObject, _ vcp: UInt8) -> (cur: Int, max: Int)? {
+        guard let readI2C, let writeI2C else { return nil }
+        let p = Unmanaged.passUnretained(svc).toOpaque()
+        var req: [UInt8] = [0x82, 0x01, vcp]; req.append(checksum(req))
+        for _ in 0..<3 {
+            if writeI2C(p, 0x37, 0x51, &req, UInt32(req.count)) == kIOReturnSuccess {
+                usleep(40_000)
+                var rep = [UInt8](repeating: 0, count: 11)
+                if readI2C(p, 0x37, 0x51, &rep, UInt32(rep.count)) == kIOReturnSuccess,
+                   rep[2] == 0x02, rep[3] == 0, rep[4] == vcp {
+                    let max = Int(rep[6]) << 8 | Int(rep[7])
+                    if max > 0 { return (Int(rep[8]) << 8 | Int(rep[9]), max) }
+                }
+            }
+            usleep(50_000)
+        }
+        return nil
+    }
+
+    static func write(_ svc: AnyObject, _ vcp: UInt8, _ value: Int) {
+        guard let writeI2C else { return }
+        let p = Unmanaged.passUnretained(svc).toOpaque()
+        var req: [UInt8] = [0x84, 0x03, vcp, UInt8(value >> 8 & 0xFF), UInt8(value & 0xFF)]; req.append(checksum(req))
+        for _ in 0..<2 {
+            if writeI2C(p, 0x37, 0x51, &req, UInt32(req.count)) == kIOReturnSuccess { return }
+            usleep(20_000)
+        }
+    }
+
+    private static var pending: [String: Int] = [:]
+    private static let lock = NSLock()
+
+    /// Queue a write from the main thread; while one is in flight only the latest value is kept,
+    /// so dragging a slider doesn't pile up slow bus writes.
+    static func set(_ svc: AnyObject, _ id: CGDirectDisplayID, _ vcp: UInt8, _ value: Int) {
+        let k = key(id, vcp)
+        if let c = cache[k] { cache[k] = (value, c.max) }
+        lock.lock(); let idle = pending.updateValue(value, forKey: k) == nil; lock.unlock()
+        guard idle else { return }
+        queue.async {
+            lock.lock(); let v = pending.removeValue(forKey: k); lock.unlock()
+            if let v { write(svc, vcp, v); usleep(50_000) }  // give the monitor time before the next write
+        }
+    }
+}
+
+/// Built-in display brightness via the private DisplayServices framework.
+enum BuiltIn {
+    private static let lib = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
+    private static let get = sym(lib, "DisplayServicesGetBrightness",
+        (@convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32).self)
+    private static let set = sym(lib, "DisplayServicesSetBrightness",
+        (@convention(c) (CGDirectDisplayID, Float) -> Int32).self)
+
+    static func brightness(_ id: CGDirectDisplayID) -> Float? {
+        var v: Float = 0
+        guard let get, get(id, &v) == 0 else { return nil }
+        return v
+    }
+    static func setBrightness(_ id: CGDirectDisplayID, _ v: Float) { _ = set?(id, v) }
+}
+
+/// Brightness 0–100 for any display; blocking, for the CLI.
+enum Brightness {
+    static func get(_ id: CGDirectDisplayID) -> Int? {
+        if CGDisplayIsBuiltin(id) != 0 { return BuiltIn.brightness(id).map { Int(($0 * 100).rounded()) } }
+        DDC.refresh()
+        guard let svc = DDC.services[id], let r = DDC.read(svc, DDC.brightness) else { return nil }
+        return r.cur * 100 / r.max
+    }
+    static func set(_ id: CGDirectDisplayID, _ v: Int) -> Bool {
+        if CGDisplayIsBuiltin(id) != 0 { BuiltIn.setBrightness(id, Float(v) / 100); return BuiltIn.brightness(id) != nil }
+        DDC.refresh()
+        guard let svc = DDC.services[id], let r = DDC.read(svc, DDC.brightness) else { return false }
+        DDC.write(svc, DDC.brightness, v * r.max / 100)
+        return true
+    }
+}
+
+/// Volume of the default output device. Monitors over HDMI/DisplayPort usually have no
+/// software volume, so callers fall back to DDC on the display with the same name.
+enum Audio {
+    private static func address(_ sel: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+    private static let mainVolume: AudioObjectPropertySelector = 0x766D7663  // 'vmvc', kAudioHardwareServiceDeviceProperty_VirtualMainVolume
+
+    static func defaultOutput() -> AudioObjectID? {
+        var dev = AudioObjectID(0), size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var a = address(kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal)
+        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &dev)
+        return err == noErr && dev != 0 ? dev : nil
+    }
+
+    static func name(_ dev: AudioObjectID) -> String? {
+        var name: Unmanaged<CFString>?, size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var a = address(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal)
+        guard AudioObjectGetPropertyData(dev, &a, 0, nil, &size, &name) == noErr else { return nil }
+        return name?.takeRetainedValue() as String?
+    }
+
+    /// 0–1, or nil if the device has no settable software volume.
+    static func volume(_ dev: AudioObjectID) -> Float? {
+        var a = address(mainVolume, kAudioDevicePropertyScopeOutput)
+        var settable: DarwinBoolean = false
+        guard AudioObjectHasProperty(dev, &a), AudioObjectIsPropertySettable(dev, &a, &settable) == noErr, settable.boolValue
+        else { return nil }
+        var v: Float32 = 0, size = UInt32(MemoryLayout<Float32>.size)
+        return AudioObjectGetPropertyData(dev, &a, 0, nil, &size, &v) == noErr ? v : nil
+    }
+
+    static func setVolume(_ dev: AudioObjectID, _ v: Float) {
+        var a = address(mainVolume, kAudioDevicePropertyScopeOutput)
+        var value = Float32(v)
+        AudioObjectSetPropertyData(dev, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
+    }
+
+    /// The display whose speakers are the default output, if its volume has to go over DDC.
+    static func ddcDisplay(for dev: AudioObjectID) -> CGDirectDisplayID? {
+        guard volume(dev) == nil, let n = name(dev) else { return nil }
+        return Displays.active().first { Displays.name(of: $0) == n }
+    }
+}
+
+/// Reconnect every disabled display. Returns whether any display was reconnected.
+@discardableResult
+func reconnectAll() -> Bool {
     let disabled = Displays.known().filter { !Displays.isEnabled($0.id) }
     for d in disabled { Displays.set(d.id, enabled: true) }
-    if !disabled.isEmpty { Thread.sleep(forTimeInterval: 1.5) }  // let reconnected displays come online
-    Displays.save(Displays.known().filter { Displays.isEnabled($0.id) })
+    return !disabled.isEmpty
+}
+
+/// Forget displays that are physically gone.
+func forgetUnplugged() { Displays.save(Displays.known().filter { Displays.isEnabled($0.id) }) }
+
+/// Blocking version for the CLI; the menu bar app must not sleep on the main thread.
+func resetAllConnections() {
+    if reconnectAll() { Thread.sleep(forTimeInterval: 1.5) }  // let reconnected displays come online
+    forgetUnplugged()
 }
 
 // MARK: - Menu bar app
 
 final class ModeItem: NSMenuItem { var displayID: CGDirectDisplayID = 0; var target_mode: Mode? }
 
+/// A menu row with an icon, a slider and a percentage.
+final class SliderView: NSView {
+    let slider = NSSlider(value: 0, minValue: 0, maxValue: 100, target: nil, action: nil)
+    let label = NSTextField(labelWithString: "")
+    var onChange: ((Int) -> Void)?
+    private(set) var touched = false
+
+    init(symbol: String, tip: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 26))
+        autoresizingMask = .width
+        toolTip = tip
+        let icon = NSImageView(frame: NSRect(x: 30, y: 5, width: 16, height: 16))
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
+        icon.contentTintColor = .secondaryLabelColor
+        slider.frame = NSRect(x: 52, y: 3, width: 260 - 52 - 52, height: 20)
+        slider.autoresizingMask = .width
+        slider.controlSize = .small
+        slider.isContinuous = true
+        slider.isEnabled = false
+        slider.target = self; slider.action = #selector(changed)
+        label.frame = NSRect(x: 260 - 48, y: 5, width: 36, height: 16)
+        label.autoresizingMask = .minXMargin
+        label.alignment = .right
+        label.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        label.textColor = .secondaryLabelColor
+        [icon, slider, label].forEach(addSubview)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func show(_ value: Int, max: Int) {
+        slider.maxValue = Double(max); slider.integerValue = value; slider.isEnabled = true; updateLabel()
+    }
+    private func updateLabel() { label.stringValue = "\(Int((slider.doubleValue / slider.maxValue * 100).rounded()))%" }
+    @objc private func changed() { touched = true; updateLabel(); onChange?(slider.integerValue) }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
-    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    var item: NSStatusItem!
+    var relayout: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        item.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "DisplayToggle")
-        let menu = NSMenu(); menu.delegate = self; item.menu = menu
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        // A large monitor next to a smaller MacBook; older systems lack that symbol, so fall back.
+        item.button?.image = NSImage(systemSymbolName: "desktopcomputer.and.macbook", accessibilityDescription: "DisplayToggle")
+            ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "DisplayToggle")
+        let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false; item.menu = menu
 
         // Safety net: if every screen goes dark (e.g. the built-in display is disconnected and then
         // the external cable is unplugged), automatically reconnect everything.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
             guard flags.contains(.removeFlag) || flags.contains(.disabledFlag) else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                if Displays.active().isEmpty {
-                    for d in Displays.known() { Displays.set(d.id, enabled: true) }
-                }
+                if Displays.active().isEmpty { reconnectAll() }
             }
         }, nil)
+
+        // After a display change the menu bar is rebuilt and status items can end up overlapping;
+        // once things settle, hide and re-show ours so the system lays it out again.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.relayout?.cancel()
+            let work = DispatchWorkItem {
+                guard let item = self?.item else { return }
+                item.isVisible = false
+                DispatchQueue.main.async { item.isVisible = true }
+            }
+            self?.relayout = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        DDC.refresh()
         for d in Displays.known() {
             let on = Displays.isEnabled(d.id)
             let main = on && CGDisplayIsMain(d.id) != 0 ? " (\(L("main")))" : ""
@@ -210,31 +459,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             } else if !on {
                 header.attributedTitle = titled(d.name, sub: L("disconnected"))
             }
-            let sub = NSMenu()
+            menu.addItem(header)
+
             let toggle = NSMenuItem(title: on ? L("disconnect") : L("connect"), action: #selector(toggle(_:)), keyEquivalent: "")
-            toggle.tag = Int(d.id); toggle.target = self
-            sub.addItem(toggle)
+            toggle.tag = Int(d.id); toggle.target = self; toggle.indentationLevel = 1
+            menu.addItem(toggle)
 
             if on {
-                sub.addItem(.separator())
-                sub.addItem(sectionHeader(L("resolution")))
-                let cur = Modes.current(d.id)
-                for m in Modes.sizes(d.id) {
-                    var title = m.sizeLabel
-                    if m.isDefault { title += " — \(L("default"))" }
-                    sub.addItem(modeItem(title, d.id, m, checked: m.sizeKey == cur?.sizeKey))
-                }
-                let rates = Modes.rates(d.id)
-                if rates.count > 1 {
-                    sub.addItem(.separator())
-                    sub.addItem(sectionHeader(L("refresh")))
-                    for m in rates { sub.addItem(modeItem(m.hzLabel, d.id, m, checked: m.hz == cur?.hz)) }
-                }
+                let modes = NSMenuItem(title: L("modes"), action: nil, keyEquivalent: "")
+                modes.indentationLevel = 1; modes.submenu = modesMenu(d.id)
+                menu.addItem(modes)
+                if let row = brightnessRow(d.id) { menu.addItem(row) }
             }
-            header.submenu = sub
-            menu.addItem(header)
+            menu.addItem(.separator())
         }
-        menu.addItem(.separator())
+        if let dev = Audio.defaultOutput(), let row = volumeRow(dev) {
+            menu.addItem(sectionHeader("\(L("volume")) · \(Audio.name(dev) ?? "")"))
+            menu.addItem(row)
+            menu.addItem(.separator())
+        }
         let reset = NSMenuItem(title: L("resetConnections"), action: #selector(resetConnections), keyEquivalent: "r")
         reset.target = self; reset.toolTip = L("resetTip")
         menu.addItem(reset)
@@ -263,6 +506,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(NSMenuItem(title: L("quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
+    func modesMenu(_ id: CGDirectDisplayID) -> NSMenu {
+        let sub = NSMenu()
+        sub.addItem(sectionHeader(L("resolution")))
+        let cur = Modes.current(id)
+        for m in Modes.sizes(id) {
+            var title = m.sizeLabel
+            if m.isDefault { title += " — \(L("default"))" }
+            sub.addItem(modeItem(title, id, m, checked: m.sizeKey == cur?.sizeKey))
+        }
+        let rates = Modes.rates(id)
+        if rates.count > 1 {
+            sub.addItem(.separator())
+            sub.addItem(sectionHeader(L("refresh")))
+            for m in rates { sub.addItem(modeItem(m.hzLabel, id, m, checked: m.hz == cur?.hz)) }
+        }
+        return sub
+    }
+
+    func sliderItem(_ view: SliderView) -> NSMenuItem { let i = NSMenuItem(); i.view = view; return i }
+
+    func brightnessRow(_ id: CGDirectDisplayID) -> NSMenuItem? {
+        let view = SliderView(symbol: "sun.max", tip: L("brightness"))
+        if CGDisplayIsBuiltin(id) != 0 {
+            guard let v = BuiltIn.brightness(id) else { return nil }
+            view.show(Int((v * 100).rounded()), max: 100)
+            view.onChange = { BuiltIn.setBrightness(id, Float($0) / 100) }
+        } else {
+            guard let svc = DDC.services[id] else { return nil }
+            loadDDC(view, svc, id, DDC.brightness)
+        }
+        return sliderItem(view)
+    }
+
+    func volumeRow(_ dev: AudioObjectID) -> NSMenuItem? {
+        let view = SliderView(symbol: "speaker.wave.2", tip: L("volume"))
+        if let v = Audio.volume(dev) {
+            view.show(Int((v * 100).rounded()), max: 100)
+            view.onChange = { Audio.setVolume(dev, Float($0) / 100) }
+        } else if let id = Audio.ddcDisplay(for: dev), let svc = DDC.services[id] {
+            loadDDC(view, svc, id, DDC.volume)
+        } else { return nil }
+        return sliderItem(view)
+    }
+
+    /// Show the cached value right away, then read the real one off the main thread (DDC is slow).
+    func loadDDC(_ view: SliderView, _ svc: AnyObject, _ id: CGDirectDisplayID, _ vcp: UInt8) {
+        let k = DDC.key(id, vcp)
+        if let c = DDC.cache[k] { view.show(c.cur, max: c.max) }
+        view.onChange = { DDC.set(svc, id, vcp, $0) }
+        DDC.queue.async {
+            let r = DDC.read(svc, vcp)
+            DispatchQueue.main.async {
+                guard let r else {
+                    if DDC.cache[k] == nil { view.label.stringValue = ""; view.toolTip = L("unsupported") }
+                    return
+                }
+                DDC.cache[k] = r
+                if !view.touched { view.show(r.cur, max: r.max) }
+            }
+        }
+    }
+
     func titled(_ title: String, sub: String) -> NSAttributedString {
         let s = NSMutableAttributedString(string: title, attributes: [.font: NSFont.menuFont(ofSize: 0)])
         s.append(NSAttributedString(string: "\n" + sub, attributes: [
@@ -282,17 +587,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         return i
     }
 
+    // Display changes run on the next run loop pass, after the menu has fully closed, so the
+    // status bar isn't being torn down and relaid out while our menu is still tracking.
     @objc func toggle(_ sender: NSMenuItem) {
         let id = CGDirectDisplayID(sender.tag)
-        if let err = Displays.set(id, enabled: !Displays.isEnabled(id)) { alert(err) }
+        DispatchQueue.main.async {
+            if let err = Displays.set(id, enabled: !Displays.isEnabled(id)) { self.alertLater(err) }
+        }
     }
 
     @objc func setMode(_ sender: ModeItem) {
-        guard let m = sender.target_mode, let err = Modes.apply(sender.displayID, m) else { return }
-        alert(err)
+        guard let m = sender.target_mode else { return }
+        let id = sender.displayID
+        DispatchQueue.main.async {
+            if let err = Modes.apply(id, m) { self.alertLater(err) }
+        }
     }
 
-    @objc func resetConnections() { resetAllConnections() }
+    @objc func resetConnections() {
+        DispatchQueue.main.async {
+            // Wait for reconnected displays to come online without blocking the main thread.
+            let delay: Double = reconnectAll() ? 1.5 : 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { forgetUnplugged() }
+        }
+    }
 
     @objc func setLanguage(_ sender: NSMenuItem) {
         let code = sender.representedObject as? String ?? ""
@@ -354,6 +672,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func alert(_ s: String) { let a = NSAlert(); a.messageText = s; a.runModal() }
+
+    /// Show an error once the display change has settled, so the modal doesn't block the relayout.
+    func alertLater(_ s: String) { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.alert(s) } }
 }
 
 // MARK: - Entry
@@ -374,6 +695,8 @@ if args.isEmpty {
                DisplayToggle off|on|toggle <display>
                DisplayToggle modes <display>        list resolutions
                DisplayToggle res <display> <W>x<H> [hidpi] [<Hz>]
+               DisplayToggle brightness <display> [0-100]
+               DisplayToggle volume [0-100]         volume of the current output device
                DisplayToggle reset                  reset connections (reconnect all)
                DisplayToggle login [on|off]         launch at login
         <display> = index, display ID, or part of the name
@@ -421,6 +744,33 @@ if args.isEmpty {
         guard let m = candidates.first else { print("No matching mode. Try: DisplayToggle modes \(args[1])"); exit(2) }
         if let err = Modes.apply(d.id, m) { print(err); exit(2) }
         print("\(d.name): \(m.sizeLabel) @ \(m.hzLabel)")
+    case "brightness":
+        guard args.count >= 2 else { usage() }
+        let d = display(args[1])
+        var value: Int?
+        if args.count >= 3 {
+            guard let v = Int(args[2]), (0...100).contains(v) else { usage() }
+            // Monitors often ignore DDC reads right after a write, so report the value we set.
+            value = Brightness.set(d.id, v) ? v : nil
+        } else { value = Brightness.get(d.id) }
+        guard let v = value else { print("\(d.name): \(L("brightness")) \(L("unsupported"))"); exit(2) }
+        print("\(d.name): \(L("brightness")) \(v)%")
+    case "volume":
+        guard let dev = Audio.defaultOutput() else { print(L("failed")); exit(2) }
+        let name = Audio.name(dev) ?? "?"
+        let target = args.count >= 2 ? Int(args[1]) : nil
+        if args.count >= 2, target == nil || !(0...100).contains(target!) { usage() }
+        if Audio.volume(dev) != nil {
+            if let t = target { Audio.setVolume(dev, Float(t) / 100) }
+            print("\(name): \(L("volume")) \(Int(((Audio.volume(dev) ?? 0) * 100).rounded()))%")
+        } else {
+            DDC.refresh()
+            guard let id = Audio.ddcDisplay(for: dev), let svc = DDC.services[id], let r = DDC.read(svc, DDC.volume)
+            else { print("\(name): \(L("volume")) \(L("unsupported"))"); exit(2) }
+            var cur = r.cur
+            if let t = target { cur = t * r.max / 100; DDC.write(svc, DDC.volume, cur) }
+            print("\(name): \(L("volume")) \(cur * 100 / r.max)%")
+        }
     case "reset", "all-on":
         resetAllConnections()
         print(L("resetConnections") + " ✓")
