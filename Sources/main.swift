@@ -33,6 +33,7 @@ func L(_ key: String) -> String {
         "resetAllTip": "对所有显示器执行重置：重新连接所有被断开的显示器，并移除已经拔掉线的显示器记录。不会改动分辨率等其他设置。",
         "quit": "退出", "launchAtLogin": "登录时启动", "needsApproval": "需要在系统设置中允许", "approvalTitle": "DisplayToggle 需要你的授权", "approvalBody": "请在「系统设置 → 通用 → 登录项」中允许 DisplayToggle，才能登录时自动启动。", "openSettings": "打开系统设置", "later": "稍后", "language": "语言", "system": "跟随系统",
         "lastDisplay": "不能断开最后一个显示器",
+        "lidClosed": "已合盖", "lidClosedError": "合盖时无法更改内置显示器",
         "failed": "操作失败",
         "keepAwake": "保持唤醒", "awakeActive": "生效中", "awakeIdle": "未生效", "awakeOff": "已关闭",
         "awakeAlways": "全部：始终保持唤醒", "awakeBattery": "仅电池：只在使用电池时保持唤醒", "awakeAC": "仅插电：只在接通电源时保持唤醒",
@@ -50,6 +51,7 @@ func L(_ key: String) -> String {
         "resetAllTip": "Reset every display: reconnect every disconnected display and drop displays that are physically unplugged. Resolution and other settings are left unchanged.",
         "quit": "Quit", "launchAtLogin": "Launch at Login", "needsApproval": "Needs approval in System Settings", "approvalTitle": "DisplayToggle needs your approval", "approvalBody": "Allow DisplayToggle in System Settings → General → Login Items to launch it at login.", "openSettings": "Open System Settings", "later": "Later", "language": "Language", "system": "System Default",
         "lastDisplay": "Can't disconnect the last display",
+        "lidClosed": "Lid closed", "lidClosedError": "Can't change the built-in display while the lid is closed",
         "failed": "Operation failed",
         "keepAwake": "Keep Awake", "awakeActive": "Active", "awakeIdle": "Inactive", "awakeOff": "Off",
         "awakeAlways": "Always: stay awake all the time", "awakeBattery": "On Battery: stay awake only on battery power", "awakeAC": "Plugged In: stay awake only on AC power",
@@ -62,7 +64,22 @@ func L(_ key: String) -> String {
 
 // MARK: - Displays
 
-struct KnownDisplay: Codable { var id: UInt32; var name: String }
+struct KnownDisplay: Codable {
+    var id: UInt32; var name: String
+    /// Remembered while active: CGDisplayIsBuiltin can't be trusted for a display that's disabled.
+    var builtin: Bool? = nil
+}
+
+/// Whether the laptop lid is closed (always false on Macs without one).
+enum Lid {
+    static var isClosed: Bool {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0 else { return false }
+        defer { IOObjectRelease(root) }
+        let v = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)
+        return v?.takeRetainedValue() as? Bool ?? false
+    }
+}
 
 enum Displays {
     static let key = "knownDisplays"
@@ -83,17 +100,26 @@ enum Displays {
 
     /// Known displays, including disabled ones (which vanish from the system list, so we remember them).
     static func known() -> [KnownDisplay] {
-        var list: [KnownDisplay] = []
-        if let data = UserDefaults.standard.data(forKey: key),
-           let saved = try? JSONDecoder().decode([KnownDisplay].self, from: data) { list = saved }
+        var list = saved()
         for id in active() {
-            let n = name(of: id) ?? "Display \(id)"
-            if let i = list.firstIndex(where: { $0.id == id }) { list[i].name = n }
-            else { list.append(KnownDisplay(id: id, name: n)) }
+            let n = name(of: id) ?? "Display \(id)", b = CGDisplayIsBuiltin(id) != 0
+            if let i = list.firstIndex(where: { $0.id == id }) { list[i].name = n; list[i].builtin = b }
+            else { list.append(KnownDisplay(id: id, name: n, builtin: b)) }
         }
         save(list)
         return list
     }
+
+    static func saved() -> [KnownDisplay] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let list = try? JSONDecoder().decode([KnownDisplay].self, from: data) else { return [] }
+        return list
+    }
+
+    static func isBuiltin(_ d: KnownDisplay) -> Bool { d.builtin ?? (CGDisplayIsBuiltin(d.id) != 0) }
+
+    /// A built-in display that's inactive only because the lid is closed, not because we disabled it.
+    static func lidClosed(_ d: KnownDisplay) -> Bool { isBuiltin(d) && !isEnabled(d.id) && Lid.isClosed }
 
     static func save(_ list: [KnownDisplay]) {
         if let data = try? JSONEncoder().encode(list) { UserDefaults.standard.set(data, forKey: key) }
@@ -103,6 +129,11 @@ enum Displays {
 
     @discardableResult
     static func set(_ id: CGDirectDisplayID, enabled: Bool) -> String? {
+        // With the lid closed the system owns the built-in panel; toggling it then leaves it
+        // soft-disabled, and black once the lid opens without an external display.
+        if CGDisplayIsBuiltin(id) != 0 || saved().contains(where: { $0.id == id && $0.builtin == true }), Lid.isClosed {
+            return L("lidClosedError")
+        }
         if !enabled {
             let act = active()
             if act.contains(id) && act.count <= 1 { return L("lastDisplay") }
@@ -375,16 +406,28 @@ func reconnectAll() -> Bool {
     return !disabled.isEmpty
 }
 
-/// Forget displays that are physically gone.
-func forgetUnplugged() { Displays.save(Displays.known().filter { Displays.isEnabled($0.id) }) }
+/// Forget displays that are physically gone. The built-in display is never forgotten: it can't be
+/// unplugged, and if it's still disabled the safety net needs to know about it.
+func forgetUnplugged() { Displays.save(Displays.known().filter { Displays.isEnabled($0.id) || Displays.isBuiltin($0) }) }
 
 /// Forget one display if it's still not active, i.e. physically gone. Returns whether it was forgotten.
 /// Plugging it back in makes it active again, and known() picks it up from there.
 @discardableResult
 func forgetIfGone(_ id: CGDirectDisplayID) -> Bool {
-    if Displays.isEnabled(id) { return false }
-    Displays.save(Displays.known().filter { $0.id != id })
+    let list = Displays.known()
+    if Displays.isEnabled(id) || list.contains(where: { $0.id == id && Displays.isBuiltin($0) }) { return false }
+    Displays.save(list.filter { $0.id != id })
     return true
+}
+
+/// Safety net: with no external display active and the lid open, a built-in display we disabled
+/// would leave the Mac with no screen at all, so turn it back on.
+func restoreBuiltInIfAlone() {
+    let act = Displays.active()
+    guard !act.contains(where: { CGDisplayIsBuiltin($0) == 0 }) else { return }
+    let off = Displays.saved().filter { Displays.isBuiltin($0) && !act.contains($0.id) }
+    guard !off.isEmpty, !Lid.isClosed else { return }
+    for d in off { Displays.set(d.id, enabled: true) }
 }
 
 /// Blocking version for the CLI; the menu bar app must not sleep on the main thread.
@@ -610,6 +653,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var item: NSStatusItem!
     var relayout: DispatchWorkItem?
     var signals: [DispatchSourceSignal] = []
+    var safetyTimer: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // A plain SIGTERM (e.g. `pkill` in `make install`/`uninstall`) would skip applicationWillTerminate
@@ -627,14 +671,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "DisplayToggle")
         let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false; item.menu = menu
 
-        // Safety net: if every screen goes dark (e.g. the built-in display is disconnected and then
-        // the external cable is unplugged), automatically reconnect everything.
+        // Safety net: never leave the Mac without a screen (e.g. the built-in display is disconnected,
+        // then the external cable is unplugged). Unplugging with the lid closed usually sleeps the Mac,
+        // and opening the lid later brings no display event, so besides reacting to display changes
+        // and wake-ups, also check periodically — it's cheap.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
-            guard flags.contains(.removeFlag) || flags.contains(.disabledFlag) else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                if Displays.active().isEmpty { reconnectAll() }
-            }
+            guard !flags.contains(.beginConfigurationFlag) else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restoreBuiltInIfAlone() }
         }, nil)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                          object: nil, queue: .main) { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restoreBuiltInIfAlone() }
+        }
+        safetyTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in restoreBuiltInIfAlone() }
+        restoreBuiltInIfAlone()
 
         // After a display change the menu bar is rebuilt and status items can end up overlapping;
         // once things settle, hide and re-show ours so the system lays it out again.
@@ -662,12 +712,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let on = Displays.isEnabled(d.id)
             let main = on && CGDisplayIsMain(d.id) != 0 ? " (\(L("main")))" : ""
 
-            let sub = on ? Modes.current(d.id).map { "\($0.sizeLabel) · \($0.hzLabel)" } ?? L("connected") : L("disconnected")
+            let lid = Displays.lidClosed(d)
+            let sub = on ? Modes.current(d.id).map { "\($0.sizeLabel) · \($0.hzLabel)" } ?? L("connected")
+                : L(lid ? "lidClosed" : "disconnected")
             let id = d.id
-            var buttons = [DisplayHeaderView.Button(
+            var buttons = lid ? [] : [DisplayHeaderView.Button(
                 symbol: on ? "cable.connector" : "cable.connector.slash", tip: on ? L("disconnect") : L("connect"),
                 tint: on ? .controlAccentColor : .secondaryLabelColor, action: { [weak self] in self?.toggle(id) })]
-            if !on {
+            if !on && !lid {
                 buttons.append(.init(symbol: "arrow.clockwise", tip: L("resetTip"), tint: .secondaryLabelColor,
                                      action: { [weak self] in self?.reset(id) }))
             }
