@@ -16,6 +16,7 @@ A tiny, free macOS menu bar app that <b>soft-disconnects</b> any display — no 
 - **Resolution & refresh rate** — lists every mode, including HiDPI and the system default.
 - **Brightness & volume sliders** right in the menu. External monitors are controlled over DDC/CI (Apple silicon; the monitor must support DDC), the built-in display natively. Volume follows the current output device, using the monitor's own volume over DDC when audio goes through HDMI/DisplayPort.
 - **Reset** — each disconnected display has a ↻ button that re-checks it: reconnect it if it's still plugged in; if it was unplugged, drop it from the menu until it's plugged back in.
+- **Keep Awake** — Caffeine-style: keep the Mac running instead of sleeping, even with the lid closed and no display attached. Pick **Always**, **On Battery**, or **Plugged In**; it follows the power source automatically. Click the selected option again to turn it off. Plugged in, it works like `caffeinate -i -s` and needs nothing else. On battery, macOS ignores that, so preventing sleep with the lid closed needs a one-time admin approval (asked only for **Always** and **On Battery**), which installs a sudoers rule (`/etc/sudoers.d/displaytoggle`) allowing only `pmset -a disablesleep 0|1`. Below 10% battery it lets the Mac sleep again, so it never runs flat. Everything is undone when the app quits.
 - **Reset Connections** (⌘R) — reset every display at once: reconnect everything that was disconnected and forget displays that were physically unplugged. Resolutions are left alone.
 - **Safety net** — you can't disconnect the last display, and if all screens ever go dark (e.g. built-in disconnected, then the external cable is pulled) everything is reconnected automatically.
 - **Session-only** — disconnections reset on logout/restart, so you can never lock yourself out with a black screen.
@@ -70,7 +71,7 @@ Disconnection uses the private CoreGraphics function `CGSConfigureDisplayEnabled
 
 ## Uninstall
 
-Turn off **Launch at Login** in the menu, quit, and delete `/Applications/DisplayToggle.app` (or run `make uninstall`).
+Turn off **Launch at Login** in the menu, quit, and delete `/Applications/DisplayToggle.app` (or run `make uninstall`). If you used Keep Awake, also run `sudo rm /etc/sudoers.d/displaytoggle`.
 
 ## License
 

@@ -4,6 +4,8 @@ import AppKit
 import CoreAudio
 import CoreGraphics
 import IOKit
+import IOKit.ps
+import IOKit.pwr_mgt
 import ServiceManagement
 import UserNotifications
 
@@ -32,6 +34,11 @@ func L(_ key: String) -> String {
         "quit": "退出", "launchAtLogin": "登录时启动", "needsApproval": "需要在系统设置中允许", "approvalTitle": "DisplayToggle 需要你的授权", "approvalBody": "请在「系统设置 → 通用 → 登录项」中允许 DisplayToggle，才能登录时自动启动。", "openSettings": "打开系统设置", "later": "稍后", "language": "语言", "system": "跟随系统",
         "lastDisplay": "不能断开最后一个显示器",
         "failed": "操作失败",
+        "keepAwake": "保持唤醒", "awakeActive": "生效中", "awakeIdle": "未生效", "awakeOff": "已关闭",
+        "awakeAlways": "全部：始终保持唤醒", "awakeBattery": "仅电池：只在使用电池时保持唤醒", "awakeAC": "仅插电：只在接通电源时保持唤醒",
+        "awakeTip": "让 Mac 持续运行、不进入睡眠，合上盖子、不接显示器时也一样（屏幕仍可正常关闭）。再次点击已选中的图标即可关闭。合盖时请勿将 Mac 放进包里，以免过热。",
+        "awakeNoLid": "电池下合盖未授权",
+        "awakeHelperPrompt": "DisplayToggle 需要管理员授权一次，才能在使用电池且合上盖子时阻止睡眠。",
     ]
     let en: [String: String] = [
         "connected": "Connected", "disconnected": "Disconnected", "main": "Main",
@@ -44,6 +51,11 @@ func L(_ key: String) -> String {
         "quit": "Quit", "launchAtLogin": "Launch at Login", "needsApproval": "Needs approval in System Settings", "approvalTitle": "DisplayToggle needs your approval", "approvalBody": "Allow DisplayToggle in System Settings → General → Login Items to launch it at login.", "openSettings": "Open System Settings", "later": "Later", "language": "Language", "system": "System Default",
         "lastDisplay": "Can't disconnect the last display",
         "failed": "Operation failed",
+        "keepAwake": "Keep Awake", "awakeActive": "Active", "awakeIdle": "Inactive", "awakeOff": "Off",
+        "awakeAlways": "Always: stay awake all the time", "awakeBattery": "On Battery: stay awake only on battery power", "awakeAC": "Plugged In: stay awake only on AC power",
+        "awakeTip": "Keep the Mac running instead of sleeping — even with the lid closed and no display attached (screens can still turn off). Click the selected icon again to turn it off. Don't put a closed, awake Mac in a bag — it can overheat.",
+        "awakeNoLid": "lid on battery not authorized",
+        "awakeHelperPrompt": "DisplayToggle needs administrator approval once to prevent sleep when the lid is closed on battery power.",
     ]
     return (isChinese ? zh : en)[key] ?? key
 }
@@ -299,7 +311,7 @@ enum Brightness {
         if CGDisplayIsBuiltin(id) != 0 { return BuiltIn.brightness(id).map { Int(($0 * 100).rounded()) } }
         DDC.refresh()
         guard let svc = DDC.services[id], let r = DDC.read(svc, DDC.brightness) else { return nil }
-        return r.cur * 100 / r.max
+        return min(100, r.cur * 100 / r.max)
     }
     static func set(_ id: CGDirectDisplayID, _ v: Int) -> Bool {
         if CGDisplayIsBuiltin(id) != 0 { BuiltIn.setBrightness(id, Float(v) / 100); return BuiltIn.brightness(id) != nil }
@@ -379,6 +391,141 @@ func forgetIfGone(_ id: CGDirectDisplayID) -> Bool {
 func resetAllConnections() {
     if reconnectAll() { Thread.sleep(forTimeInterval: 1.5) }  // let reconnected displays come online
     forgetUnplugged()
+}
+
+// MARK: - Keep awake
+
+enum AwakeMode: String { case off, always, battery, ac }
+
+/// Caffeinate-style keep-awake. Two IOPM assertions, like `caffeinate -i -s`: one stops idle sleep,
+/// the other (honored on AC power only) also keeps the Mac running with the lid closed. On battery
+/// the lid still sleeps it unless system sleep is disabled (`pmset disablesleep 1`), which needs
+/// root, so a one-time sudoers rule lets us run exactly that command without a password.
+enum KeepAwake {
+    static let key = "keepAwake", ownedKey = "sleepDisabledByUs"
+    static let sudoers = "/etc/sudoers.d/displaytoggle"
+    private static var assertions: [IOPMAssertionID] = []
+    private static var helperOK: Bool?
+    private static var installing = false
+
+    static var mode: AwakeMode {
+        get { AwakeMode(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .off }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: key); update() }
+    }
+
+    static func onBattery() -> Bool {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return false }
+        return type as String == kIOPMBatteryPowerKey
+    }
+
+    /// Whether any battery is at or below 10%. Below that we stop disabling sleep, so a closed Mac
+    /// on battery gets to sleep (and save its state) instead of running until it dies.
+    static func batteryLow() -> Bool {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return false }
+        return list.contains { ps in
+            guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+                  let cur = d[kIOPSCurrentCapacityKey] as? Int, let max = d[kIOPSMaxCapacityKey] as? Int, max > 0
+            else { return false }
+            return cur * 100 / max <= 10
+        }
+    }
+
+    /// Whether the current mode applies to the current power source.
+    static var isActive: Bool {
+        switch mode {
+        case .off: return false
+        case .always: return true
+        case .battery: return onBattery()
+        case .ac: return !onBattery()
+        }
+    }
+
+    /// Apply the saved mode and follow power source changes (plugging in / unplugging).
+    static func start() {
+        if let src = IOPSNotificationCreateRunLoopSource({ _ in KeepAwake.update() }, nil)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
+        }
+        update()
+    }
+
+    static func update() {
+        let on = isActive
+        if on && assertions.isEmpty {
+            for type in [kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionTypePreventSystemSleep] {
+                var id: IOPMAssertionID = 0
+                if IOPMAssertionCreateWithName(type as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                               "DisplayToggle Keep Awake" as CFString, &id) == kIOReturnSuccess { assertions.append(id) }
+            }
+        } else if !on { releaseAssertions() }
+        setSleepDisabled(on && onBattery() && !batteryLow())
+    }
+
+    /// Undo everything, e.g. on quit, so the Mac never stays sleepless behind our back.
+    static func stop() {
+        releaseAssertions()
+        setSleepDisabled(false)
+    }
+
+    private static func releaseAssertions() { assertions.forEach { IOPMAssertionRelease($0) }; assertions = [] }
+
+    /// Whether a mode can be active on battery, where only `pmset disablesleep` survives a closed lid.
+    static func needsHelper(_ m: AwakeMode) -> Bool { m == .always || m == .battery }
+
+    @discardableResult
+    private static func run(_ path: String, _ args: [String]) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    static var helperInstalled: Bool {
+        if helperOK != true { helperOK = run("/usr/bin/sudo", ["-n", "-l", "/usr/bin/pmset", "-a", "disablesleep", "1"]) }
+        return helperOK!
+    }
+
+    /// Ask for an admin password once to install the sudoers rule, then report whether it's in place.
+    /// Runs in a separate osascript process: shown from our own (menu bar, never frontmost) process,
+    /// the password dialog doesn't get keyboard focus.
+    static func installHelper(_ done: @escaping (Bool) -> Void) {
+        if helperInstalled { done(true); return }
+        guard !installing else { return }  // a password dialog is already up
+        installing = true
+        let line = "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+        let sh = "f=$(/usr/bin/mktemp) && printf '%s\\n' '\(line)' > \"$f\" && /usr/sbin/visudo -cf \"$f\" && "
+            + "/usr/bin/install -m 0440 -o root -g wheel \"$f\" \(sudoers); rc=$?; rm -f \"$f\"; exit $rc"
+        let quoted = sh.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "do shell script \"\(quoted)\" with prompt \"\(L("awakeHelperPrompt"))\" with administrator privileges"
+        DispatchQueue.global().async {
+            run("/usr/bin/osascript", ["-e", script])
+            DispatchQueue.main.async { installing = false; helperOK = nil; done(helperInstalled) }
+        }
+    }
+
+    /// Whether system sleep is currently disabled (`pmset -g` shows "SleepDisabled 1").
+    private static func sleepDisabled() -> Bool {
+        let p = Process(), pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset"); p.arguments = ["-g"]
+        p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        return out.split(separator: "\n").contains { $0.split(whereSeparator: \.isWhitespace) == ["SleepDisabled", "1"] }
+    }
+
+    private static func setSleepDisabled(_ on: Bool) {
+        let owned = UserDefaults.standard.bool(forKey: ownedKey)
+        // Only ever undo what we did ourselves; leave a user's own `pmset disablesleep` alone.
+        guard on != owned, helperInstalled else { return }
+        if on && sleepDisabled() { return }  // already disabled by the user: don't claim it
+        if run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", on ? "1" : "0"]) {
+            UserDefaults.standard.set(on, forKey: ownedKey)
+        }
+    }
 }
 
 // MARK: - Menu bar app
@@ -462,8 +609,18 @@ final class SliderView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var item: NSStatusItem!
     var relayout: DispatchWorkItem?
+    var signals: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // A plain SIGTERM (e.g. `pkill` in `make install`/`uninstall`) would skip applicationWillTerminate
+        // and leave sleep disabled; route it through a normal quit instead.
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { NSApp.terminate(nil) }
+            src.resume(); signals.append(src)
+        }
+
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         // A large monitor next to a smaller MacBook; older systems lack that symbol, so fall back.
         item.button?.image = NSImage(systemSymbolName: "desktopcomputer.and.macbook", accessibilityDescription: "DisplayToggle")
@@ -492,7 +649,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             self?.relayout = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
         }
+
+        KeepAwake.start()
     }
+
+    func applicationWillTerminate(_ n: Notification) { KeepAwake.stop() }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
@@ -531,6 +692,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         resetAll.target = self; resetAll.toolTip = L("resetAllTip")
         menu.addItem(resetAll)
         menu.addItem(.separator())
+        menu.addItem(awakeRow())
+        menu.addItem(.separator())
         // Always reflect the real system state, read fresh each time the menu opens.
         let login = NSMenuItem(title: L("launchAtLogin"), action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
@@ -553,6 +716,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         lang.submenu = langMenu
         menu.addItem(lang)
         menu.addItem(NSMenuItem(title: L("quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    /// Same look as a display row: status on the left, one icon per mode on the right, the
+    /// selected one in the accent color. Clicking the selected icon turns keep-awake off.
+    func awakeRow() -> NSMenuItem {
+        let cur = KeepAwake.mode
+        var sub = L(cur == .off ? "awakeOff" : KeepAwake.isActive ? "awakeActive" : "awakeIdle")
+        if KeepAwake.needsHelper(cur) && !KeepAwake.helperInstalled { sub += " · \(L("awakeNoLid"))" }
+        // Later SF Symbols first, older fallbacks after.
+        let modes: [(AwakeMode, [String], String)] = [(.always, ["infinity"], "awakeAlways"),
+            (.battery, ["battery.75percent", "battery.75", "battery.100"], "awakeBattery"),
+            (.ac, ["powerplug", "bolt"], "awakeAC")]
+        let buttons = modes.map { m, symbols, tip in
+            DisplayHeaderView.Button(
+                symbol: symbols.first { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil } ?? symbols[0],
+                tip: L(tip), tint: m == cur ? .controlAccentColor : .secondaryLabelColor,
+                action: { [weak self] in self?.setAwake(m == KeepAwake.mode ? .off : m) })
+        }
+        let item = NSMenuItem()
+        item.view = DisplayHeaderView(title: L("keepAwake"), sub: sub, buttons: buttons)
+        item.view?.toolTip = L("awakeTip")
+        return item
     }
 
     func modesMenu(_ id: CGDirectDisplayID) -> NSMenu {
@@ -669,6 +854,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    func setAwake(_ mode: AwakeMode) {
+        DispatchQueue.main.async {
+            KeepAwake.mode = mode  // the assertions work right away; the helper only adds lid-closed on battery
+            guard KeepAwake.needsHelper(mode) else { return }
+            // If the dialog is cancelled the menu header says so; picking the mode again asks again.
+            KeepAwake.installHelper { if $0 { KeepAwake.update() } }
+        }
+    }
+
     @objc func setLanguage(_ sender: NSMenuItem) {
         let code = sender.representedObject as? String ?? ""
         if code.isEmpty { UserDefaults.standard.removeObject(forKey: "language") }
@@ -728,7 +922,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         done([.banner, .sound])
     }
 
-    func alert(_ s: String) { let a = NSAlert(); a.messageText = s; a.runModal() }
+    // A menu bar app is never frontmost, so activate first or the alert opens behind other windows.
+    func alert(_ s: String) { let a = NSAlert(); a.messageText = s; NSApp.activate(ignoringOtherApps: true); a.runModal() }
 
     /// Show an error once the display change has settled, so the modal doesn't block the relayout.
     func alertLater(_ s: String) { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.alert(s) } }
@@ -826,7 +1021,7 @@ if args.isEmpty {
             else { print("\(name): \(L("volume")) \(L("unsupported"))"); exit(2) }
             var cur = r.cur
             if let t = target { cur = t * r.max / 100; DDC.write(svc, DDC.volume, cur) }
-            print("\(name): \(L("volume")) \(cur * 100 / r.max)%")
+            print("\(name): \(L("volume")) \(min(100, cur * 100 / r.max))%")
         }
     case "reset", "all-on":
         if args.count >= 2 {
