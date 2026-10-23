@@ -15,7 +15,8 @@ A tiny, free macOS menu bar app that <b>soft-disconnects</b> any display — no 
 - **Disconnect / reconnect any display** from the menu bar. macOS treats a disconnected display as if its cable were unplugged: windows move to the remaining screens and the GPU stops driving it. Works for external monitors and the MacBook built-in display.
 - **Resolution & refresh rate** — lists every mode, including HiDPI and the system default.
 - **Brightness & volume sliders** right in the menu. External monitors are controlled over DDC/CI (Apple silicon; the monitor must support DDC), the built-in display natively. Volume follows the current output device, using the monitor's own volume over DDC when audio goes through HDMI/DisplayPort.
-- **Reset Connections** (⌘R) — reconnect everything that was disconnected and forget displays that were physically unplugged. Resolutions are left alone.
+- **Reset** — each disconnected display has a ↻ button that re-checks it: reconnect it if it's still plugged in; if it was unplugged, drop it from the menu until it's plugged back in.
+- **Reset Connections** (⌘R) — reset every display at once: reconnect everything that was disconnected and forget displays that were physically unplugged. Resolutions are left alone.
 - **Safety net** — you can't disconnect the last display, and if all screens ever go dark (e.g. built-in disconnected, then the external cable is pulled) everything is reconnected automatically.
 - **Session-only** — disconnections reset on logout/restart, so you can never lock yourself out with a black screen.
 - **Launch at Login** toggle (native macOS Login Items). The checkmark always shows the real system state; if macOS needs your approval, the item says so and a notification takes you to System Settings.
@@ -52,7 +53,8 @@ $CLI list                          # list displays with state and current mode
 $CLI off Sceptre                   # disconnect (by index, display ID, or part of the name)
 $CLI on 2                          # reconnect
 $CLI toggle "LG"                   # toggle
-$CLI reset                         # reconnect all, forget unplugged displays
+$CLI reset LG                      # reset one display: reconnect if plugged in, else forget
+$CLI reset                         # reset every display
 $CLI modes Sceptre                 # list all resolutions / refresh rates
 $CLI res Sceptre 2560x1440 hidpi 60
 $CLI brightness LG 60               # brightness 0–100 (omit the value to read it)

@@ -9,8 +9,9 @@ let sh = NSShadow(); sh.shadowColor = NSColor.black.withAlphaComponent(0.3); sh.
 NSColor.white.setFill(); shape.fill()
 NSGraphicsContext.current?.restoreGraphicsState()
 NSGradient(colors: [NSColor(red: 0.30, green: 0.55, blue: 1.0, alpha: 1), NSColor(red: 0.42, green: 0.25, blue: 0.92, alpha: 1)])!.draw(in: shape, angle: -60)
-let cfg = NSImage.SymbolConfiguration(pointSize: 470, weight: .medium).applying(.init(paletteColors: [.white]))
-let sym = NSImage(systemSymbolName: "display.2", accessibilityDescription: nil)!.withSymbolConfiguration(cfg)!
+let cfg = NSImage.SymbolConfiguration(pointSize: 400, weight: .medium).applying(.init(paletteColors: [.white]))
+// Same symbol as the menu bar icon.
+let sym = NSImage(systemSymbolName: "desktopcomputer.and.macbook", accessibilityDescription: nil)!.withSymbolConfiguration(cfg)!
 let sz = sym.size
 sym.draw(in: NSRect(x: (S - sz.width)/2, y: (S - sz.height)/2 + 10, width: sz.width, height: sz.height))
 img.unlockFocus()

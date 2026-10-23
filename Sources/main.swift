@@ -26,8 +26,9 @@ func L(_ key: String) -> String {
         "connect": "连接", "disconnect": "断开",
         "resolution": "分辨率", "refresh": "刷新率", "default": "默认", "modes": "分辨率与刷新率",
         "brightness": "亮度", "volume": "音量", "unsupported": "不支持",
-        "resetConnections": "重置连接",
-        "resetTip": "重新连接所有被断开的显示器，并移除已经拔掉线、无法再连接的显示器记录。不会改动分辨率等其他设置。",
+        "resetConnections": "重置连接", "forgotten": "未检测到，已移除",
+        "resetTip": "重新检测这台显示器：线还插着就重新连接；已经拔掉就先从列表中移除，以后再插上时会自动重新出现。",
+        "resetAllTip": "对所有显示器执行重置：重新连接所有被断开的显示器，并移除已经拔掉线的显示器记录。不会改动分辨率等其他设置。",
         "quit": "退出", "launchAtLogin": "登录时启动", "needsApproval": "需要在系统设置中允许", "approvalTitle": "DisplayToggle 需要你的授权", "approvalBody": "请在「系统设置 → 通用 → 登录项」中允许 DisplayToggle，才能登录时自动启动。", "openSettings": "打开系统设置", "later": "稍后", "language": "语言", "system": "跟随系统",
         "lastDisplay": "不能断开最后一个显示器",
         "failed": "操作失败",
@@ -37,8 +38,9 @@ func L(_ key: String) -> String {
         "connect": "Connect", "disconnect": "Disconnect",
         "resolution": "Resolution", "refresh": "Refresh Rate", "default": "Default", "modes": "Resolution & Refresh Rate",
         "brightness": "Brightness", "volume": "Volume", "unsupported": "Not supported",
-        "resetConnections": "Reset Connections",
-        "resetTip": "Reconnect every disconnected display and drop displays that are physically unplugged. Resolution and other settings are left unchanged.",
+        "resetConnections": "Reset Connections", "forgotten": "not detected, removed",
+        "resetTip": "Re-check this display: reconnect it if it's still plugged in; if it's been unplugged, remove it from the list until it's plugged back in.",
+        "resetAllTip": "Reset every display: reconnect every disconnected display and drop displays that are physically unplugged. Resolution and other settings are left unchanged.",
         "quit": "Quit", "launchAtLogin": "Launch at Login", "needsApproval": "Needs approval in System Settings", "approvalTitle": "DisplayToggle needs your approval", "approvalBody": "Allow DisplayToggle in System Settings → General → Login Items to launch it at login.", "openSettings": "Open System Settings", "later": "Later", "language": "Language", "system": "System Default",
         "lastDisplay": "Can't disconnect the last display",
         "failed": "Operation failed",
@@ -364,6 +366,15 @@ func reconnectAll() -> Bool {
 /// Forget displays that are physically gone.
 func forgetUnplugged() { Displays.save(Displays.known().filter { Displays.isEnabled($0.id) }) }
 
+/// Forget one display if it's still not active, i.e. physically gone. Returns whether it was forgotten.
+/// Plugging it back in makes it active again, and known() picks it up from there.
+@discardableResult
+func forgetIfGone(_ id: CGDirectDisplayID) -> Bool {
+    if Displays.isEnabled(id) { return false }
+    Displays.save(Displays.known().filter { $0.id != id })
+    return true
+}
+
 /// Blocking version for the CLI; the menu bar app must not sleep on the main thread.
 func resetAllConnections() {
     if reconnectAll() { Thread.sleep(forTimeInterval: 1.5) }  // let reconnected displays come online
@@ -371,6 +382,44 @@ func resetAllConnections() {
 }
 
 // MARK: - Menu bar app
+
+/// A display's header row: name and status on the left, icon buttons on the right.
+final class DisplayHeaderView: NSView {
+    struct Button { let symbol: String; let tip: String; let tint: NSColor; let action: () -> Void }
+    private let buttons: [Button]
+
+    init(title: String, sub: String, buttons: [Button]) {
+        self.buttons = buttons
+        let name = NSTextField(labelWithString: title)
+        name.font = .menuFont(ofSize: 0)
+        let detail = NSTextField(labelWithString: sub)
+        detail.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
+        detail.textColor = .secondaryLabelColor
+        let textW = max(name.fittingSize.width, detail.fittingSize.width)
+        let width = max(260, 14 + textW + 12 + CGFloat(buttons.count) * 26 + 10)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 38))
+        autoresizingMask = .width
+        name.frame = NSRect(x: 14, y: 19, width: textW, height: 16)
+        detail.frame = NSRect(x: 14, y: 4, width: textW, height: 14)
+        [name, detail].forEach(addSubview)
+        var x = width - 10
+        for (i, b) in buttons.enumerated().reversed() {
+            x -= 26
+            let btn = NSButton(image: NSImage(systemSymbolName: b.symbol, accessibilityDescription: b.tip) ?? NSImage(),
+                               target: self, action: #selector(clicked(_:)))
+            btn.isBordered = false; btn.imagePosition = .imageOnly
+            btn.tag = i; btn.toolTip = b.tip; btn.contentTintColor = b.tint
+            btn.frame = NSRect(x: x, y: 9, width: 24, height: 20); btn.autoresizingMask = .minXMargin
+            addSubview(btn)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func clicked(_ sender: NSButton) {
+        enclosingMenuItem?.menu?.cancelTracking()
+        buttons[sender.tag].action()
+    }
+}
 
 final class ModeItem: NSMenuItem { var displayID: CGDirectDisplayID = 0; var target_mode: Mode? }
 
@@ -452,18 +501,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let on = Displays.isEnabled(d.id)
             let main = on && CGDisplayIsMain(d.id) != 0 ? " (\(L("main")))" : ""
 
-            let header = NSMenuItem(title: d.name + main, action: nil, keyEquivalent: "")
-            header.state = on ? .on : .off
-            if on, let cur = Modes.current(d.id) {
-                header.attributedTitle = titled(d.name + main, sub: "\(cur.sizeLabel) · \(cur.hzLabel)")
-            } else if !on {
-                header.attributedTitle = titled(d.name, sub: L("disconnected"))
+            let sub = on ? Modes.current(d.id).map { "\($0.sizeLabel) · \($0.hzLabel)" } ?? L("connected") : L("disconnected")
+            let id = d.id
+            var buttons = [DisplayHeaderView.Button(
+                symbol: on ? "cable.connector" : "cable.connector.slash", tip: on ? L("disconnect") : L("connect"),
+                tint: on ? .controlAccentColor : .secondaryLabelColor, action: { [weak self] in self?.toggle(id) })]
+            if !on {
+                buttons.append(.init(symbol: "arrow.clockwise", tip: L("resetTip"), tint: .secondaryLabelColor,
+                                     action: { [weak self] in self?.reset(id) }))
             }
+            let header = NSMenuItem()
+            header.view = DisplayHeaderView(title: d.name + main, sub: sub, buttons: buttons)
             menu.addItem(header)
-
-            let toggle = NSMenuItem(title: on ? L("disconnect") : L("connect"), action: #selector(toggle(_:)), keyEquivalent: "")
-            toggle.tag = Int(d.id); toggle.target = self; toggle.indentationLevel = 1
-            menu.addItem(toggle)
 
             if on {
                 let modes = NSMenuItem(title: L("modes"), action: nil, keyEquivalent: "")
@@ -478,9 +527,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             menu.addItem(row)
             menu.addItem(.separator())
         }
-        let reset = NSMenuItem(title: L("resetConnections"), action: #selector(resetConnections), keyEquivalent: "r")
-        reset.target = self; reset.toolTip = L("resetTip")
-        menu.addItem(reset)
+        let resetAll = NSMenuItem(title: L("resetConnections"), action: #selector(resetConnections), keyEquivalent: "r")
+        resetAll.target = self; resetAll.toolTip = L("resetAllTip")
+        menu.addItem(resetAll)
         menu.addItem(.separator())
         // Always reflect the real system state, read fresh each time the menu opens.
         let login = NSMenuItem(title: L("launchAtLogin"), action: #selector(toggleLogin), keyEquivalent: "")
@@ -589,8 +638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     // Display changes run on the next run loop pass, after the menu has fully closed, so the
     // status bar isn't being torn down and relaid out while our menu is still tracking.
-    @objc func toggle(_ sender: NSMenuItem) {
-        let id = CGDirectDisplayID(sender.tag)
+    func toggle(_ id: CGDirectDisplayID) {
         DispatchQueue.main.async {
             if let err = Displays.set(id, enabled: !Displays.isEnabled(id)) { self.alertLater(err) }
         }
@@ -609,6 +657,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             // Wait for reconnected displays to come online without blocking the main thread.
             let delay: Double = reconnectAll() ? 1.5 : 0
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { forgetUnplugged() }
+        }
+    }
+
+    /// Make the logical state match the physical one: reconnect if still plugged in, otherwise forget.
+    func reset(_ id: CGDirectDisplayID) {
+        DispatchQueue.main.async {
+            Displays.set(id, enabled: true)
+            // Wait for it to come online without blocking the main thread.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { forgetIfGone(id) }
         }
     }
 
@@ -697,7 +754,7 @@ if args.isEmpty {
                DisplayToggle res <display> <W>x<H> [hidpi] [<Hz>]
                DisplayToggle brightness <display> [0-100]
                DisplayToggle volume [0-100]         volume of the current output device
-               DisplayToggle reset                  reset connections (reconnect all)
+               DisplayToggle reset [<display>]      reconnect if plugged in, else forget (all if omitted)
                DisplayToggle login [on|off]         launch at login
         <display> = index, display ID, or part of the name
         """); exit(1)
@@ -772,8 +829,17 @@ if args.isEmpty {
             print("\(name): \(L("volume")) \(cur * 100 / r.max)%")
         }
     case "reset", "all-on":
-        resetAllConnections()
-        print(L("resetConnections") + " ✓")
+        if args.count >= 2 {
+            let d = display(args[1])
+            if !Displays.isEnabled(d.id) {
+                Displays.set(d.id, enabled: true)
+                Thread.sleep(forTimeInterval: 1.5)  // let it come online
+            }
+            print("\(d.name): \(forgetIfGone(d.id) ? L("forgotten") : L("connected"))")
+        } else {
+            resetAllConnections()
+            print(L("resetConnections") + " ✓")
+        }
     case "login":
         let svc = SMAppService.mainApp
         do {
