@@ -106,6 +106,7 @@ enum Displays {
             if let i = list.firstIndex(where: { $0.id == id }) { list[i].name = n; list[i].builtin = b }
             else { list.append(KnownDisplay(id: id, name: n, builtin: b)) }
         }
+        list = list.filter { !isBuiltin($0) } + list.filter { isBuiltin($0) }  // external displays first
         save(list)
         return list
     }
@@ -420,15 +421,23 @@ func forgetIfGone(_ id: CGDirectDisplayID) -> Bool {
     return true
 }
 
-/// Safety net: with no external display active and the lid open, a built-in display we disabled
-/// would leave the Mac with no screen at all, so turn it back on.
-func restoreBuiltInIfAlone() {
+/// Safety net: never leave the Mac with no screen at all.
+/// - Lid open and no external display active: a built-in display we disabled must come back on.
+/// - Nothing active at all (lid closed, last external unplugged): reconnect the external displays
+///   we disabled. Unplugged ones are still remembered and get tried too, so attempts are spaced out
+///   to keep our own reconfigurations from re-triggering this in a loop.
+func ensureAScreen() {
     let act = Displays.active()
-    guard !act.contains(where: { CGDisplayIsBuiltin($0) == 0 }) else { return }
-    let off = Displays.saved().filter { Displays.isBuiltin($0) && !act.contains($0.id) }
-    guard !off.isEmpty, !Lid.isClosed else { return }
+    var off: [KnownDisplay] = []
+    if !act.contains(where: { CGDisplayIsBuiltin($0) == 0 }), !Lid.isClosed {
+        off = Displays.saved().filter { Displays.isBuiltin($0) && !act.contains($0.id) }
+    }
+    if act.isEmpty && off.isEmpty { off = Displays.saved().filter { !Displays.isBuiltin($0) } }
+    guard !off.isEmpty, Date().timeIntervalSince(lastRescue) >= 10 else { return }
+    lastRescue = Date()
     for d in off { Displays.set(d.id, enabled: true) }
 }
+private var lastRescue = Date.distantPast
 
 /// Blocking version for the CLI; the menu bar app must not sleep on the main thread.
 func resetAllConnections() {
@@ -488,7 +497,7 @@ enum KeepAwake {
     /// Apply the saved mode and follow power source changes (plugging in / unplugging).
     static func start() {
         if let src = IOPSNotificationCreateRunLoopSource({ _ in KeepAwake.update() }, nil)?.takeRetainedValue() {
-            CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         }
         update()
     }
@@ -654,6 +663,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var relayout: DispatchWorkItem?
     var signals: [DispatchSourceSignal] = []
     var safetyTimer: Timer?
+    var menuOpen = false, needsReshow = false
+    var menuState = ""
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // A plain SIGTERM (e.g. `pkill` in `make install`/`uninstall`) would skip applicationWillTerminate
@@ -677,25 +688,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // and wake-ups, also check periodically — it's cheap.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
             guard !flags.contains(.beginConfigurationFlag) else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restoreBuiltInIfAlone() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                ensureAScreen(); (NSApp.delegate as? AppDelegate)?.refreshMenuIfChanged()
+            }
         }, nil)
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
                                                           object: nil, queue: .main) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { restoreBuiltInIfAlone() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { ensureAScreen() }
         }
-        safetyTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in restoreBuiltInIfAlone() }
-        restoreBuiltInIfAlone()
+        // Common modes, so it keeps running while our menu is open; it also catches the lid
+        // opening or closing, which has no notification, to keep an open menu up to date.
+        let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in ensureAScreen(); self?.refreshMenuIfChanged() }
+        RunLoop.main.add(timer, forMode: .common)
+        safetyTimer = timer
+        ensureAScreen()
 
         // After a display change the menu bar is rebuilt and status items can end up overlapping;
-        // once things settle, hide and re-show ours so the system lays it out again.
+        // once things settle, hide and re-show ours so the system lays it out again. Hiding it would
+        // close an open menu, so then wait until the menu closes.
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.relayout?.cancel()
-            let work = DispatchWorkItem {
-                guard let item = self?.item else { return }
-                item.isVisible = false
-                DispatchQueue.main.async { item.isVisible = true }
-            }
+            let work = DispatchWorkItem { self?.reshowItem() }
             self?.relayout = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
         }
@@ -705,7 +719,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     func applicationWillTerminate(_ n: Notification) { KeepAwake.stop() }
 
+    func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        if needsReshow { DispatchQueue.main.async { self.reshowItem() } }
+    }
+
+    func reshowItem() {
+        guard !menuOpen else { needsReshow = true; return }
+        needsReshow = false
+        item.isVisible = false
+        DispatchQueue.main.async { self.item.isVisible = true }
+    }
+
+    /// What the menu shows that can change on its own while it's open.
+    var currentMenuState: String { "\(Displays.active()) \(Lid.isClosed) \(KeepAwake.isActive)" }
+
+    /// Rebuild an open menu when displays, the lid or the power source changed. Only on a change,
+    /// so a slider being dragged isn't torn down every tick.
+    func refreshMenuIfChanged() {
+        guard menuOpen, let menu = item.menu, currentMenuState != menuState else { return }
+        menuNeedsUpdate(menu)
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
+        menuState = currentMenuState
         menu.removeAllItems()
         DDC.refresh()
         for d in Displays.known() {
