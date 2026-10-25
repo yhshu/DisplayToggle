@@ -421,23 +421,27 @@ func forgetIfGone(_ id: CGDirectDisplayID) -> Bool {
     return true
 }
 
-/// Safety net: never leave the Mac with no screen at all.
-/// - Lid open and no external display active: a built-in display we disabled must come back on.
-/// - Nothing active at all (lid closed, last external unplugged): reconnect the external displays
-///   we disabled. Unplugged ones are still remembered and get tried too, so attempts are spaced out
-///   to keep our own reconfigurations from re-triggering this in a loop.
+/// Safety net: with the lid open and no external display active, a built-in display we disabled must
+/// come back on (e.g. it was disconnected while an external was in use, then the lid was closed, the
+/// external unplugged and the lid opened again). Nothing else is touched: with the lid closed the user
+/// may be shutting down or carrying the Mac away, and an external display that went missing may just
+/// be asleep or switched off. Disconnecting the last active display is blocked in Displays.set.
+/// Only while the screens are awake, and only once no external has been active for a while, so an
+/// external still waking up doesn't turn on a built-in display the user turned off.
 func ensureAScreen() {
     let act = Displays.active()
-    var off: [KnownDisplay] = []
-    if !act.contains(where: { CGDisplayIsBuiltin($0) == 0 }), !Lid.isClosed {
-        off = Displays.saved().filter { Displays.isBuiltin($0) && !act.contains($0.id) }
-    }
-    if act.isEmpty && off.isEmpty { off = Displays.saved().filter { !Displays.isBuiltin($0) } }
-    guard !off.isEmpty, Date().timeIntervalSince(lastRescue) >= 10 else { return }
-    lastRescue = Date()
+    let off = screensAsleep || Lid.isClosed || act.contains(where: { CGDisplayIsBuiltin($0) == 0 }) ? []
+        : Displays.saved().filter { Displays.isBuiltin($0) && !act.contains($0.id) }
+    guard !off.isEmpty else { aloneSince = nil; return }
+    let since = aloneSince ?? Date()
+    aloneSince = since
+    guard Date().timeIntervalSince(since) >= 8 else { return }
+    aloneSince = nil
     for d in off { Displays.set(d.id, enabled: true) }
 }
-private var lastRescue = Date.distantPast
+/// Set from screen sleep/wake notifications; also covers system sleep and DarkWake, when the screens stay off.
+var screensAsleep = false
+private var aloneSince: Date?
 
 /// Blocking version for the CLI; the menu bar app must not sleep on the main thread.
 func resetAllConnections() {
@@ -682,19 +686,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "DisplayToggle")
         let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false; item.menu = menu
 
-        // Safety net: never leave the Mac without a screen (e.g. the built-in display is disconnected,
-        // then the external cable is unplugged). Unplugging with the lid closed usually sleeps the Mac,
-        // and opening the lid later brings no display event, so besides reacting to display changes
-        // and wake-ups, also check periodically — it's cheap.
+        // Safety net: with the lid open, don't leave the built-in display disconnected when no external
+        // display is left (see ensureAScreen). Opening the lid brings no display event, so besides
+        // reacting to display changes, also check periodically — it's cheap.
         CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
             guard !flags.contains(.beginConfigurationFlag) else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 ensureAScreen(); (NSApp.delegate as? AppDelegate)?.refreshMenuIfChanged()
             }
         }, nil)
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
-                                                          object: nil, queue: .main) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { ensureAScreen() }
+        let ws = NSWorkspace.shared.notificationCenter
+        for (name, asleep) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.willSleepNotification, true),
+                               (NSWorkspace.screensDidWakeNotification, false), (NSWorkspace.didWakeNotification, false)] {
+            ws.addObserver(forName: name, object: nil, queue: .main) { _ in screensAsleep = asleep; ensureAScreen() }
         }
         // Common modes, so it keeps running while our menu is open; it also catches the lid
         // opening or closing, which has no notification, to keep an open menu up to date.
