@@ -39,6 +39,9 @@ func L(_ key: String) -> String {
         "awakeAlways": "全部：始终保持唤醒", "awakeBattery": "仅电池：只在使用电池时保持唤醒", "awakeAC": "仅插电：只在接通电源时保持唤醒",
         "awakeTip": "让 Mac 持续运行、不进入睡眠，合上盖子、不接显示器时也一样（屏幕仍可正常关闭）。再次点击已选中的图标即可关闭。合盖时请勿将 Mac 放进包里，以免过热。",
         "awakeNoLid": "电池下合盖未授权",
+        "keepScreen": "屏幕常亮",
+        "screenAlways": "全部：始终保持屏幕常亮", "screenBattery": "仅电池：只在使用电池时保持屏幕常亮", "screenAC": "仅插电：只在接通电源时保持屏幕常亮",
+        "screenTip": "屏幕不会因闲置而变暗或关闭（Mac 也因此不会睡眠）。带 PROLED XDR 显示屏的新款 MacBook Pro 背面的 Apple Logo 只在屏幕亮着时发光，所以开启后它也会一直亮着；合盖时内置屏幕关闭，Logo 由系统控制。电池电量低于 10% 时自动失效。再次点击已选中的图标即可关闭。",
         "awakeHelperPrompt": "DisplayToggle 需要管理员授权一次，才能在使用电池且合上盖子时阻止睡眠。",
     ]
     let en: [String: String] = [
@@ -57,6 +60,9 @@ func L(_ key: String) -> String {
         "awakeAlways": "Always: stay awake all the time", "awakeBattery": "On Battery: stay awake only on battery power", "awakeAC": "Plugged In: stay awake only on AC power",
         "awakeTip": "Keep the Mac running instead of sleeping — even with the lid closed and no display attached (screens can still turn off). Click the selected icon again to turn it off. Don't put a closed, awake Mac in a bag — it can overheat.",
         "awakeNoLid": "lid on battery not authorized",
+        "keepScreen": "Keep Screen On",
+        "screenAlways": "Always: keep the screen on all the time", "screenBattery": "On Battery: keep the screen on only on battery power", "screenAC": "Plugged In: keep the screen on only on AC power",
+        "screenTip": "Keep the screen from dimming or turning off when idle (which also keeps the Mac from sleeping). On MacBook Pro with PROLED XDR display, the glowing Apple logo on the lid is only lit while the screen is on, so this keeps it lit too; with the lid closed the built-in screen is off and macOS controls the logo. Stops below 10% battery. Click the selected icon again to turn it off.",
         "awakeHelperPrompt": "DisplayToggle needs administrator approval once to prevent sleep when the lid is closed on battery power.",
     ]
     return (isChinese ? zh : en)[key] ?? key
@@ -458,9 +464,12 @@ enum AwakeMode: String { case off, always, battery, ac }
 /// the lid still sleeps it unless system sleep is disabled (`pmset disablesleep 1`), which needs
 /// root, so a one-time sudoers rule lets us run exactly that command without a password.
 enum KeepAwake {
-    static let key = "keepAwake", ownedKey = "sleepDisabledByUs"
+    static let key = "keepAwake", ownedKey = "sleepDisabledByUs", screenKey = "keepScreen"
     static let sudoers = "/etc/sudoers.d/displaytoggle"
     private static var assertions: [IOPMAssertionID] = []
+    /// Held on top of `assertions` while the screen (and the lid logo, which only glows while the
+    /// built-in screen is on) should stay lit too.
+    private static var screenAssertion: IOPMAssertionID?
     private static var helperOK: Bool?
     private static var installing = false
     /// Called after every update, so the menu bar icon can follow the state.
@@ -469,6 +478,12 @@ enum KeepAwake {
     static var mode: AwakeMode {
         get { AwakeMode(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .off }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: key); update() }
+    }
+
+    /// Separate from `mode`: also keep the screen from idle-dimming/sleeping. Off by default.
+    static var screenMode: AwakeMode {
+        get { AwakeMode(rawValue: UserDefaults.standard.string(forKey: screenKey) ?? "") ?? .off }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: screenKey); update() }
     }
 
     static func onBattery() -> Bool {
@@ -491,8 +506,11 @@ enum KeepAwake {
     }
 
     /// Whether the current mode applies to the current power source.
-    static var isActive: Bool {
-        switch mode {
+    static var isActive: Bool { applies(mode) }
+    static var screenActive: Bool { applies(screenMode) && !(onBattery() && batteryLow()) }
+
+    static func applies(_ m: AwakeMode) -> Bool {
+        switch m {
         case .off: return false
         case .always: return true
         case .battery: return onBattery()
@@ -517,6 +535,7 @@ enum KeepAwake {
                                                "DisplayToggle Keep Awake" as CFString, &id) == kIOReturnSuccess { assertions.append(id) }
             }
         } else if !on { releaseAssertions() }
+        setScreenAssertion(screenActive)
         setSleepDisabled(on && onBattery() && !batteryLow())
         onChange?()
     }
@@ -524,10 +543,24 @@ enum KeepAwake {
     /// Undo everything, e.g. on quit, so the Mac never stays sleepless behind our back.
     static func stop() {
         releaseAssertions()
+        setScreenAssertion(false)
         setSleepDisabled(false)
     }
 
     private static func releaseAssertions() { assertions.forEach { IOPMAssertionRelease($0) }; assertions = [] }
+
+    /// Like `caffeinate -d`. There's no public API for the PROLED MacBook Pro's lid logo; macOS keeps
+    /// it lit whenever the built-in screen is on, so keeping the screen on is what keeps it glowing.
+    private static func setScreenAssertion(_ on: Bool) {
+        if on, screenAssertion == nil {
+            var id: IOPMAssertionID = 0
+            if IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                           IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                           "DisplayToggle Keep Screen On" as CFString, &id) == kIOReturnSuccess { screenAssertion = id }
+        } else if !on, let id = screenAssertion {
+            IOPMAssertionRelease(id); screenAssertion = nil
+        }
+    }
 
     /// Whether a mode can be active on battery, where only `pmset disablesleep` survives a closed lid.
     static func needsHelper(_ m: AwakeMode) -> Bool { m == .always || m == .battery }
@@ -788,7 +821,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     /// What the menu shows that can change on its own while it's open.
-    var currentMenuState: String { "\(Displays.active()) \(Lid.isClosed) \(KeepAwake.isActive)" }
+    var currentMenuState: String { "\(Displays.active()) \(Lid.isClosed) \(KeepAwake.isActive) \(KeepAwake.screenActive)" }
 
     /// Rebuild an open menu when displays, the lid or the power source changed. Only on a change,
     /// so a slider being dragged isn't torn down every tick.
@@ -838,6 +871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         menu.addItem(resetAll)
         menu.addItem(.separator())
         menu.addItem(awakeRow())
+        menu.addItem(screenRow())
         menu.addItem(.separator())
         // Always reflect the real system state, read fresh each time the menu opens.
         let login = NSMenuItem(title: L("launchAtLogin"), action: #selector(toggleLogin), keyEquivalent: "")
@@ -869,19 +903,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let cur = KeepAwake.mode
         var sub = L(cur == .off ? "awakeOff" : KeepAwake.isActive ? "awakeActive" : "awakeIdle")
         if KeepAwake.needsHelper(cur) && !KeepAwake.helperInstalled { sub += " · \(L("awakeNoLid"))" }
+        return modeRow(title: "keepAwake", sub: sub, tip: "awakeTip", prefix: "awake", current: cur) { [weak self] m in
+            self?.setAwake(m == KeepAwake.mode ? .off : m)
+        }
+    }
+
+    /// Same row as Keep Awake, with its own mode. Kept separate so the screen only stays on when asked.
+    func screenRow() -> NSMenuItem {
+        let cur = KeepAwake.screenMode
+        let sub = L(cur == .off ? "awakeOff" : KeepAwake.screenActive ? "awakeActive" : "awakeIdle")
+        return modeRow(title: "keepScreen", sub: sub, tip: "screenTip", prefix: "screen", current: cur) { m in
+            DispatchQueue.main.async { KeepAwake.screenMode = m == KeepAwake.screenMode ? .off : m }
+        }
+    }
+
+    func modeRow(title: String, sub: String, tip: String, prefix: String, current: AwakeMode,
+                 pick: @escaping (AwakeMode) -> Void) -> NSMenuItem {
         // Later SF Symbols first, older fallbacks after.
-        let modes: [(AwakeMode, [String], String)] = [(.always, ["infinity"], "awakeAlways"),
-            (.battery, ["battery.75percent", "battery.75", "battery.100"], "awakeBattery"),
-            (.ac, ["powerplug", "bolt"], "awakeAC")]
-        let buttons = modes.map { m, symbols, tip in
+        let modes: [(AwakeMode, [String], String)] = [(.always, ["infinity"], "Always"),
+            (.battery, ["battery.75percent", "battery.75", "battery.100"], "Battery"),
+            (.ac, ["powerplug", "bolt"], "AC")]
+        let buttons = modes.map { m, symbols, suffix in
             DisplayHeaderView.Button(
                 symbol: symbols.first { NSImage(systemSymbolName: $0, accessibilityDescription: nil) != nil } ?? symbols[0],
-                tip: L(tip), tint: m == cur ? .controlAccentColor : .secondaryLabelColor,
-                action: { [weak self] in self?.setAwake(m == KeepAwake.mode ? .off : m) })
+                tip: L(prefix + suffix), tint: m == current ? .controlAccentColor : .secondaryLabelColor,
+                action: { pick(m) })
         }
         let item = NSMenuItem()
-        item.view = DisplayHeaderView(title: L("keepAwake"), sub: sub, buttons: buttons)
-        item.view?.toolTip = L("awakeTip")
+        item.view = DisplayHeaderView(title: L(title), sub: sub, buttons: buttons)
+        item.view?.toolTip = L(tip)
         return item
     }
 
