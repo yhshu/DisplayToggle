@@ -463,6 +463,8 @@ enum KeepAwake {
     private static var assertions: [IOPMAssertionID] = []
     private static var helperOK: Bool?
     private static var installing = false
+    /// Called after every update, so the menu bar icon can follow the state.
+    static var onChange: (() -> Void)?
 
     static var mode: AwakeMode {
         get { AwakeMode(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .off }
@@ -516,6 +518,7 @@ enum KeepAwake {
             }
         } else if !on { releaseAssertions() }
         setSleepDisabled(on && onBattery() && !batteryLow())
+        onChange?()
     }
 
     /// Undo everything, e.g. on quit, so the Mac never stays sleepless behind our back.
@@ -662,6 +665,53 @@ final class SliderView: NSView {
     @objc private func changed() { touched = true; updateLabel(); onChange?(slider.integerValue) }
 }
 
+/// The horizontal extent of what an image actually draws, in points.
+func inkSpan(_ image: NSImage) -> ClosedRange<CGFloat>? {
+    let scale = 4, w = Int(image.size.width.rounded(.up)) * scale, h = Int(image.size.height.rounded(.up)) * scale
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8,
+                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                     bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+    rep.size = NSSize(width: w / scale, height: h / scale)  // before the context, which takes its scale from it
+    guard let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = ctx
+    image.draw(in: NSRect(origin: .zero, size: image.size))
+    NSGraphicsContext.restoreGraphicsState()
+    guard let data = rep.bitmapData else { return nil }
+    let inked = (0..<w).filter { x in (0..<h).contains { y in data[y * rep.bytesPerRow + x * 4 + 3] > 16 } }
+    guard let lo = inked.first, let hi = inked.last else { return nil }
+    return CGFloat(lo) / CGFloat(scale)...CGFloat(hi + 1) / CGFloat(scale)
+}
+
+/// The menu bar icon, with a small dot in its top right corner while keep-awake is in effect.
+/// The symbol is wider than what it draws, and the menu bar clips an image to the item, so the
+/// image is trimmed to the drawn part and the dot goes at the edge of that, above the MacBook.
+/// Drawn on demand, as pre-rendered bitmaps show up at half size in the menu bar. Still a
+/// template image, so it follows the menu bar's color and highlight.
+func statusIcon(awake: Bool) -> NSImage? {
+    // A large monitor next to a smaller MacBook; older systems lack that symbol, so fall back.
+    guard let base = NSImage(systemSymbolName: "desktopcomputer.and.macbook", accessibilityDescription: nil)
+        ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: nil) else { return nil }
+    let ink = inkSpan(base) ?? 0...base.size.width
+    let left = ink.lowerBound.rounded(.down)
+    let size = NSSize(width: (ink.upperBound - left).rounded(.up), height: base.size.height)
+    let icon = NSImage(size: size, flipped: false) { r in
+        base.draw(in: NSRect(x: -left, y: 0, width: base.size.width, height: base.size.height))
+        guard awake else { return true }
+        let dot = NSRect(x: r.maxX - 5, y: r.maxY - 5, width: 5, height: 5)
+        // Clear a thin ring first, so the dot stays apart from whatever the symbol has there.
+        NSGraphicsContext.current?.compositingOperation = .clear
+        NSBezierPath(ovalIn: dot.insetBy(dx: -1, dy: -1)).fill()
+        NSGraphicsContext.current?.compositingOperation = .sourceOver
+        NSColor.black.setFill()
+        NSBezierPath(ovalIn: dot).fill()
+        return true
+    }
+    icon.isTemplate = true
+    icon.accessibilityDescription = awake ? "DisplayToggle, \(L("keepAwake"))" : "DisplayToggle"
+    return icon
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var item: NSStatusItem!
     var relayout: DispatchWorkItem?
@@ -680,10 +730,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             src.resume(); signals.append(src)
         }
 
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        // A large monitor next to a smaller MacBook; older systems lack that symbol, so fall back.
-        item.button?.image = NSImage(systemSymbolName: "desktopcomputer.and.macbook", accessibilityDescription: "DisplayToggle")
-            ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "DisplayToggle")
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        updateIcon()
+        KeepAwake.onChange = { [weak self] in self?.updateIcon() }
         let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false; item.menu = menu
 
         // Safety net: with the lid open, don't leave the built-in display disconnected when no external
@@ -722,6 +771,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func applicationWillTerminate(_ n: Notification) { KeepAwake.stop() }
+
+    func updateIcon() { item.button?.image = statusIcon(awake: KeepAwake.isActive) }
 
     func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
     func menuDidClose(_ menu: NSMenu) {
