@@ -887,7 +887,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let lang = NSMenuItem(title: L("language"), action: nil, keyEquivalent: "")
         let langMenu = NSMenu()
         let curLang = UserDefaults.standard.string(forKey: "language") ?? ""
-        for (code, title) in [("", L("system")), ("en", "English"), ("zh", "中文")] {
+        for (code, title) in [("", L("system")), ("en", "English"), ("zh", "简体中文")] {
             let i = NSMenuItem(title: title, action: #selector(setLanguage(_:)), keyEquivalent: "")
             i.representedObject = code; i.target = self; i.state = code == curLang ? .on : .off
             langMenu.addItem(i)

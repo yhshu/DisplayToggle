@@ -22,7 +22,7 @@ A tiny, free macOS menu bar app that <b>soft-disconnects</b> any display — no 
 - **Safety net** — you can't disconnect the last active display, and with the lid open the built-in display comes back on by itself once no external display is left (e.g. built-in disconnected, then the external cable is pulled). Nothing else is reconnected behind your back: an external display that sleeps or is switched off stays the way you left the others.
 - **Session-only** — disconnections reset on logout/restart, so you can never lock yourself out with a black screen.
 - **Launch at Login** toggle (native macOS Login Items). The checkmark always shows the real system state; if macOS needs your approval, the item says so and a notification takes you to System Settings.
-- **English / 中文** UI, following the system language or chosen in the menu.
+- **English / 简体中文** UI, following the system language or chosen in the menu.
 - **Command-line interface** for scripts, Shortcuts, and hotkeys.
 
 ## Requirements
